@@ -544,6 +544,164 @@ export function getRandomColor() {
 
 export default botConfig;
 
+import discord
+from discord.ext import commands
+import aiosqlite
 
+TOKEN = MTUwNjIzNTg2OTYzNDM2NzU1OQ.GsOLRG.cnP4omuSUqGbQflvKHs7XgDBVsj0HQtA3s61Wk
+PREFIX = "!"
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+DB_PATH = "fantasy.db"
+
+# Available players on the transfer market
+MARKET = {
+    "messi": {"name": "Lionel Messi", "price": 5000, "position": "FWD"},
+    "ronaldo": {"name": "Cristiano Ronaldo", "price": 4800, "position": "FWD"},
+    "haaland": {"name": "Erling Haaland", "price": 4500, "position": "FWD"},
+    "mbappe": {"name": "Kylian Mbappé", "price": 4700, "position": "FWD"},
+    "modric": {"name": "Luka Modrić", "price": 2000, "position": "MID"},
+    "courtois": {"name": "Thibaut Courtois", "price": 1500, "position": "GK"},
+    "dimarco": {"name": "Federico Dimarco", "price": 1200, "position": "DEF"}
+}
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                credits INTEGER DEFAULT 10000
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS squads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                player_id TEXT,
+                name TEXT,
+                position TEXT,
+                value INTEGER
+            )
+        """)
+        await db.commit()
+
+async def get_credits(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT credits FROM users WHERE user_id =?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+            else:
+                await db.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+                await db.commit()
+                return 10000
+
+@bot.event
+async def on_ready():
+    await init_db()
+    print(f'{bot.user} is online!')
+    await bot.change_presence(activity=discord.Game(name="!helpmarket"))
+
+@bot.command(name="market")
+async def show_market(ctx):
+    """Display all purchasable players"""
+    embed = discord.Embed(title="🛒 Transfer Market", color=0x1abc9c)
+    for player_id, data in MARKET.items():
+        embed.add_field(
+            name=f"{data['name']} - {data['position']}",
+            value=f"ID: `{player_id}` | Price: **{data['price']}** credits",
+            inline=False
+        )
+    embed.set_footer(text="Buy with!buy <player_id>")
+    await ctx.send(embed=embed)
+
+@bot.command(name="buy")
+async def buy_player(ctx, player_id: str):
+    """Buy a player:!buy messi"""
+    player_id = player_id.lower()
+    user_id = ctx.author.id
+
+    if player_id not in MARKET:
+        await ctx.send("❌ This player doesn't exist. Use `!market` to see valid IDs.")
+        return
+
+    player = MARKET[player_id]
+    credits = await get_credits(user_id)
+
+    if credits < player["price"]:
+        await ctx.send(f"💸 Not enough credits. You need {player['price']}, you have {credits}.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Check if user already owns the player
+        async with db.execute("SELECT 1 FROM squads WHERE user_id =? AND player_id =?",
+                              (user_id, player_id)) as cursor:
+            if await cursor.fetchone():
+                await ctx.send("⚠️ You already own this player!")
+                return
+
+        # Deduct credits and add player
+        await db.execute("UPDATE users SET credits = credits -? WHERE user_id =?",
+                         (player["price"], user_id))
+        await db.execute("INSERT INTO squads (user_id, player_id, name, position, value) VALUES (?,?,?,?,?)",
+                         (user_id, player_id, player["name"], player["position"], player["price"]))
+        await db.commit()
+
+    await ctx.send(f"✅ You bought **{player['name']}** for {player['price']} credits!")
+
+@bot.command(name="release")
+async def release_player(ctx, player_id: str):
+    """Release a player and get 50% refund:!release messi"""
+    player_id = player_id.lower()
+    user_id = ctx.author.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value, name FROM squads WHERE user_id =? AND player_id =?",
+                              (user_id, player_id)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await ctx.send("❌ You don't own this player.")
+                return
+
+            value, name = row
+            refund = value // 2
+
+            await db.execute("DELETE FROM squads WHERE user_id =? AND player_id =?", (user_id, player_id))
+            await db.execute("UPDATE users SET credits = credits +? WHERE user_id =?", (refund, user_id))
+            await db.commit()
+
+    await ctx.send(f"🗑️ You released **{name}**. Refund: **{refund}** credits.")
+
+@bot.command(name="squad")
+async def show_squad(ctx, member: discord.Member = None):
+    """Show your squad or another user's:!squad @user"""
+    target = member or ctx.author
+    user_id = target.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT name, position, value, player_id FROM squads WHERE user_id =?", (user_id,)) as cursor:
+            players = await cursor.fetchall()
+
+    credits = await get_credits(user_id)
+    squad_value = sum(p[2] for p in players)
+
+    embed = discord.Embed(title=f"📋 {target.display_name}'s Squad", color=0x3498db)
+    embed.add_field(name="💰 Credits", value=f"{credits}", inline=True)
+    embed.add_field(name="💎 Squad Value", value=f"{squad_value}", inline=True)
+    embed.add_field(name="👥 Players", value=f"{len(players)}/25", inline=True)
+
+    if players:
+        player_list = "\n".join([f"**{p[0]}** - {p[1]} | `{p[3]}`" for p in players])
+        embed.description = player_list
+    else:
+        embed.description = "No players in squad. Use `!market`"
+
+    await ctx.send(embed=embed)
+
+@bot.command(name="credits")
+async def show_credits
 
 
